@@ -2,6 +2,8 @@ import time
 import requests
 import json
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -18,6 +20,21 @@ node_start_time = datetime.now(timezone.utc)
 jobs_processed = 0
 node_active = False
 node_chat_id = None
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    server = HTTPServer(("0.0.0.0", 8000), HealthHandler)
+    server.serve_forever()
 
 
 def tg(method, payload=None):
@@ -199,4 +216,7 @@ def poll():
 
 
 if __name__ == "__main__":
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    print("[AETERNUM] Health server running on port 8000")
     poll()
