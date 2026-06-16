@@ -16,10 +16,10 @@ GROQ_MODEL = "llama-3.1-8b-instant"
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-node_start_time = datetime.now(timezone.utc)
+bot_start_time = datetime.now(timezone.utc)
 jobs_processed = 0
-node_active = False
-node_chat_id = None
+jobs_lock = threading.Lock()
+pending_names = {}
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -102,14 +102,62 @@ def call_groq(prompt):
 
 
 def get_uptime():
-    delta = datetime.now(timezone.utc) - node_start_time
+    delta = datetime.now(timezone.utc) - bot_start_time
     hours, remainder = divmod(int(delta.total_seconds()), 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours}h {minutes}m {seconds}s"
 
 
+def get_active_nodes():
+    nodes = firebase_get("nodes")
+    if not nodes or not isinstance(nodes, dict):
+        return {}
+    now = datetime.now(timezone.utc).timestamp()
+    active = {}
+    for chat_id, node in nodes.items():
+        last_seen = node.get("last_seen", 0)
+        if now - last_seen < 180:
+            active[chat_id] = node
+    return active
+
+
+def register_node(chat_id, name):
+    node_data = {
+        "name": name,
+        "chat_id": chat_id,
+        "joined_at": datetime.now(timezone.utc).isoformat(),
+        "last_seen": datetime.now(timezone.utc).timestamp(),
+        "jobs": firebase_get(f"nodes/{chat_id}/jobs") or 0,
+    }
+    firebase_set(f"nodes/{chat_id}", node_data)
+    print(f"[NODE] Registered: {name} ({chat_id})")
+
+
+def remove_node(chat_id):
+    firebase_delete(f"nodes/{chat_id}")
+    print(f"[NODE] Removed: {chat_id}")
+
+
+def heartbeat():
+    while True:
+        try:
+            nodes = firebase_get("nodes")
+            if nodes and isinstance(nodes, dict):
+                now = datetime.now(timezone.utc).timestamp()
+                for chat_id, node in nodes.items():
+                    last_seen = node.get("last_seen", 0)
+                    if now - last_seen < 180:
+                        firebase_set(f"nodes/{chat_id}/last_seen", now)
+        except Exception as e:
+            print(f"[HEARTBEAT ERROR] {e}")
+        time.sleep(60)
+
+
 def process_firebase_jobs():
     global jobs_processed
+    active = get_active_nodes()
+    if not active:
+        return
     prompts = firebase_get("prompts")
     if not prompts or not isinstance(prompts, dict):
         return
@@ -122,9 +170,13 @@ def process_firebase_jobs():
         if not prompt:
             continue
 
-        print(f"[JOB] Processing {job_id}: {prompt[:60]}")
-
         firebase_set(f"prompts/{job_id}/status", "processing")
+
+        verify = firebase_get(f"prompts/{job_id}/status")
+        if verify != "processing":
+            continue
+
+        print(f"[JOB] Processing {job_id}: {prompt[:60]}")
 
         response = call_groq(prompt)
 
@@ -136,60 +188,102 @@ def process_firebase_jobs():
                 "processed_at": datetime.now(timezone.utc).isoformat(),
                 "node": "telegram",
             })
-            jobs_processed += 1
+            with jobs_lock:
+                jobs_processed += 1
             print(f"[JOB] Done {job_id}. Total jobs: {jobs_processed}")
         else:
             firebase_set(f"prompts/{job_id}/status", "failed")
 
 
 def handle_message(message):
-    global node_active, node_chat_id
-
-    chat_id = message["chat"]["id"]
+    chat_id = str(message["chat"]["id"])
     text = message.get("text", "").strip()
 
-    if text == "/start":
-        node_chat_id = chat_id
-        node_active = True
+    if chat_id in pending_names:
+        if len(text) < 2 or len(text) > 32:
+            send(message["chat"]["id"], "Node name must be between 2 and 32 characters. Try again.")
+            return
+        name = text
+        del pending_names[chat_id]
+        register_node(chat_id, name)
         send(
-            chat_id,
-            "Aeternum Node Online\n\n"
-            "Your node is now connected to the network. It will watch for incoming prompts and process them using Groq.\n\n"
+            message["chat"]["id"],
+            f"{name} is now online.\n\n"
+            "Your node is connected to the Aeternum network. It will process incoming prompts using Groq and earn AET rewards.\n\n"
             "Commands:\n"
-            "/status - view node stats\n"
+            "/status - view your node stats\n"
+            "/nodes - see all active nodes\n"
             "/stop - take your node offline\n"
             "/help - list commands",
         )
-        print(f"[NODE] Started by chat_id {chat_id}")
+        return
+
+    if text == "/start":
+        existing = firebase_get(f"nodes/{chat_id}")
+        if existing and isinstance(existing, dict):
+            now = datetime.now(timezone.utc).timestamp()
+            last_seen = existing.get("last_seen", 0)
+            if now - last_seen < 180:
+                send(
+                    message["chat"]["id"],
+                    f"{existing.get('name', 'Your node')} is already online.\n\n"
+                    "Send /status to check your stats or /stop to go offline.",
+                )
+                return
+        pending_names[chat_id] = True
+        send(message["chat"]["id"], "Welcome to Aeternum.\n\nWhat do you want to call your node?")
 
     elif text == "/status":
-        send(
-            chat_id,
-            f"Node Status: {'Active' if node_active else 'Inactive'}\n"
-            f"Uptime: {get_uptime()}\n"
-            f"Jobs processed: {jobs_processed}\n"
-            f"Network: Arbitrum Sepolia\n"
-            f"Model: {GROQ_MODEL}",
-        )
+        node = firebase_get(f"nodes/{chat_id}")
+        active = get_active_nodes()
+        if node and isinstance(node, dict):
+            now = datetime.now(timezone.utc).timestamp()
+            last_seen = node.get("last_seen", 0)
+            is_active = now - last_seen < 180
+            send(
+                message["chat"]["id"],
+                f"Node: {node.get('name', 'Unknown')}\n"
+                f"Status: {'Active' if is_active else 'Inactive'}\n"
+                f"Jobs processed: {node.get('jobs', 0)}\n"
+                f"Active nodes on network: {len(active)}\n"
+                f"Network uptime: {get_uptime()}\n"
+                f"Model: {GROQ_MODEL}",
+            )
+        else:
+            send(message["chat"]["id"], "Your node is offline. Send /start to connect to the network.")
+
+    elif text == "/nodes":
+        active = get_active_nodes()
+        if not active:
+            send(message["chat"]["id"], "No nodes are currently active on the network.")
+            return
+        lines = [f"Active nodes on Aeternum ({len(active)} online)\n"]
+        for node in active.values():
+            name = node.get("name", "Unknown")
+            jobs = node.get("jobs", 0)
+            lines.append(f"{name} — {jobs} jobs")
+        send(message["chat"]["id"], "\n".join(lines))
 
     elif text == "/stop":
-        node_active = False
-        node_chat_id = None
-        send(chat_id, "Node taken offline. Send /start to reconnect to the network.")
-        print(f"[NODE] Stopped by chat_id {chat_id}")
+        node = firebase_get(f"nodes/{chat_id}")
+        name = node.get("name", "Your node") if node and isinstance(node, dict) else "Your node"
+        remove_node(chat_id)
+        send(message["chat"]["id"], f"{name} is now offline. Send /start to reconnect to the network.")
 
     elif text == "/help":
         send(
-            chat_id,
+            message["chat"]["id"],
             "Aeternum Node Commands:\n\n"
             "/start - bring your node online\n"
-            "/status - view uptime and jobs processed\n"
+            "/status - view your node stats\n"
+            "/nodes - see all active nodes\n"
             "/stop - take your node offline\n"
             "/help - list commands",
         )
 
     else:
-        send(chat_id, "Send /start to bring your node online.")
+        if chat_id not in pending_names:
+            send(message["chat"]["id"], "Send /start to bring your node online.")
 
 
 def poll():
@@ -209,9 +303,7 @@ def poll():
         except Exception as e:
             print(f"[POLL ERROR] {e}")
 
-        if node_active:
-            process_firebase_jobs()
-
+        process_firebase_jobs()
         time.sleep(3)
 
 
@@ -219,4 +311,9 @@ if __name__ == "__main__":
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
     print("[AETERNUM] Health server running on port 8000")
+
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+    heartbeat_thread.start()
+    print("[AETERNUM] Heartbeat running")
+
     poll()
