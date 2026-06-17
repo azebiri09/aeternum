@@ -212,12 +212,19 @@ def process_firebase_jobs():
                 })
                 with jobs_lock:
                     jobs_processed += 1
+
+                handling_chat_id = next(iter(active))
+                current_jobs = active[handling_chat_id].get("jobs", 0)
+                if not isinstance(current_jobs, int):
+                    current_jobs = 0
+                firebase_set(f"nodes/{handling_chat_id}/jobs", current_jobs + 1)
+                active[handling_chat_id]["jobs"] = current_jobs + 1
+
                 print(f"[JOB] Done {job_id}. Total jobs: {jobs_processed}")
             else:
                 firebase_set(f"prompts/{job_id}/status", "failed")
     except Exception as e:
         print(f"[PROCESS JOBS ERROR] {e}")
-
 
 def handle_message(message):
     try:
